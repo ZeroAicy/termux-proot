@@ -23,6 +23,8 @@
 #include <assert.h>      /* assert(3), */
 #include <stdint.h>      /* intptr_t, */
 #include <errno.h>       /* E*, */
+#include <stdio.h>       /* FILE, fopen(3), fgets(3), sscanf(3), fclose(3), */
+#include <fcntl.h>       /* O_PATH, */
 #include <sys/stat.h>    /* chmod(2), stat(2) */
 #include <sys/types.h>   /* uid_t, gid_t, get*id(2), */
 #include <unistd.h>      /* get*id(2),  */
@@ -89,7 +91,7 @@
 	 * CAP_SETUID capability) and uid does not match the real UID	\
 	 * or saved set-user-ID of the calling process." -- man		\
 	 * setuid */							\
-	allowed = (config->euid == 0 /* TODO: || HAS_CAP(SETUID) */	\
+	allowed = (config->euid == 0 || config->initial_euid == 0 /* || HAS_CAP(SETUID) */ \
 		|| id == config->r ## id				\
 		|| id == config->e ## id				\
 		|| id == config->s ## id);				\
@@ -149,7 +151,7 @@
 	 *								\
 	 * Is it possible to "ruid <- euid" and "euid <- suid" at the	\
 	 * same time?  */						\
-	allowed = (config->euid == 0 /* TODO: || HAS_CAP(SETUID) */	\
+	allowed = (config->euid == 0 || config->initial_euid == 0 /* || HAS_CAP(SETUID) */ \
 		|| (UNCHANGED_ID(e ## id) && UNCHANGED_ID(r ## id))	\
 		|| (r ## id == config->e ## id && (e ## id == config->r ## id || UNCHANGED_ID(e ## id))) \
 		|| (e ## id == config->r ## id && (r ## id == config->e ## id || UNCHANGED_ID(r ## id))) \
@@ -207,7 +209,7 @@
 	 * Privileged processes (on Linux, those having the CAP_SETUID	\
 	 * capability) may set the real UID, effective UID, and saved	\
 	 * set-user-ID to arbitrary values." -- man setresuid */	\
-	allowed = (config->euid == 0 /* || HAS_CAP(SETUID) */		\
+	allowed = (config->euid == 0 || config->initial_euid == 0 /* || HAS_CAP(SETUID) */ \
 		|| ((UNSET_ID(r ## type ## id) || EQUALS_ANY_ID(r ## type ## id, type)) \
 		 && (UNSET_ID(e ## type ## id) || EQUALS_ANY_ID(e ## type ## id, type)) \
 		 && (UNSET_ID(s ## type ## id) || EQUALS_ANY_ID(s ## type ## id, type)))); \
@@ -246,7 +248,7 @@
 	 * superuser or if fsuid matches either the real user ID,	\
 	 * effective user ID, saved set-user-ID, or the current value	\
 	 * of fsuid." -- man setfsuid */				\
-	allowed = (config->euid == 0 /* TODO: || HAS_CAP(SETUID) */	\
+	allowed = (config->euid == 0 || config->initial_euid == 0 /* || HAS_CAP(SETUID) */ \
 		|| fs ## type ## id == config->fs ## type ## id		\
 		|| EQUALS_ANY_ID(fs ## type ## id, type));		\
 	if (allowed)							\
@@ -713,6 +715,77 @@ static int handle_sysenter_end(Tracee *tracee, Config *config)
 		return handle_chown_enter_end(tracee, config, uid_sysarg, gid_sysarg);
 #endif
 
+#ifndef USERLAND
+	case PR_openat: {
+		char path[PATH_MAX];
+		char prefix[64];
+		char *end;
+		int fd_num;
+
+		/* Only apply when the tracee has fake root (DAC override). */
+		if (config->euid != 0)
+			return 0;
+
+		/* Read the translated (host) path from the CURRENT registers.
+		 * helper_functions.h is USERLAND-only so use read_string directly. */
+		if (read_string(tracee, path,
+				peek_reg(tracee, CURRENT, SYSARG_2),
+				PATH_MAX) < 0)
+			return 0;
+
+		/* Check if the path is /proc/<tracee->pid>/fd/<N>.  This
+		 * arises when the guest opens /dev/stderr, /dev/stdout, or
+		 * /proc/self/fd/N — e.g. when a log file is a symlink to
+		 * /dev/stderr (common in containerised nginx/apache images).
+		 * The kernel rejects opening these paths when the underlying
+		 * fd target (e.g. a pty owned by root) isn't accessible to
+		 * the real non-root uid.  Using dup(N) sidesteps that check
+		 * because the fd is already open. */
+		snprintf(prefix, sizeof(prefix), "/proc/%d/fd/", tracee->pid);
+		if (strncmp(path, prefix, strlen(prefix)) != 0)
+			return 0;
+
+		errno = 0;
+		fd_num = (int) strtol(path + strlen(prefix), &end, 10);
+		if (errno != 0 || end == path + strlen(prefix) || *end != '\0' || fd_num < 0)
+			return 0;
+
+		/* If the existing fd was opened with O_PATH, dup() inherits
+		 * that flag and lseek/read/write on the duplicate return
+		 * EBADF.  This breaks the safe_open() pattern used by e.g.
+		 * systemd-machine-id-setup, which opens a file with O_PATH
+		 * first and then reopens it via /proc/self/fd/N with real
+		 * access flags.  Skip the substitution in that case — the
+		 * kernel reopens the underlying file with the requested
+		 * flags, and override_permissions() ran during the original
+		 * O_PATH open so the file is still accessible to the real
+		 * uid. */
+		{
+			char fdinfo_path[64];
+			char line[64];
+			unsigned int existing_flags = 0;
+			FILE *fdinfo;
+
+			snprintf(fdinfo_path, sizeof(fdinfo_path),
+				 "/proc/%d/fdinfo/%d", tracee->pid, fd_num);
+			fdinfo = fopen(fdinfo_path, "r");
+			if (fdinfo != NULL) {
+				while (fgets(line, sizeof(line), fdinfo) != NULL) {
+					if (sscanf(line, "flags: %o", &existing_flags) == 1)
+						break;
+				}
+				fclose(fdinfo);
+			}
+			if (existing_flags & O_PATH)
+				return 0;
+		}
+
+		set_sysnum(tracee, PR_dup);
+		poke_reg(tracee, SYSARG_1, (word_t) fd_num);
+		return 0;
+	}
+#endif /* ifndef USERLAND */
+
 	case PR_setgroups:
 	case PR_setgroups32:
 	case PR_getgroups:
@@ -1112,6 +1185,7 @@ int fake_id0_callback(Extension *extension, ExtensionEvent event, intptr_t data1
 		config->euid  = uid;
 		config->suid  = uid;
 		config->fsuid = uid;
+		config->initial_euid = uid;
 		config->rgid  = gid;
 		config->egid  = gid;
 		config->sgid  = gid;
