@@ -34,6 +34,11 @@ CFLAGS   += -Wall -Wextra -O2
 # 核心修改：-Bstatic指定后续库静态链接，-Bdynamic恢复动态链接
 LDFLAGS  += -Wl,-Bstatic -ltalloc -Wl,-Bdynamic,-z,noexecstack
 
+ifdef PROOT_WITH_LIBANDROID_SHMEM
+  CFLAGS += -DWITH_LIBANDROID_SHMEM
+  LDFLAGS += -landroid-shmem
+endif
+
 OBJECTS += \
 	cli/cli.o		\
 	cli/proot.o		\
