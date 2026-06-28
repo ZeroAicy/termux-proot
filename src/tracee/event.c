@@ -43,6 +43,7 @@
 #include "path/binding.h"
 #include "syscall/syscall.h"
 #include "syscall/seccomp.h"
+#include "syscall/pipe_shadow.h"
 #include "ptrace/wait.h"
 #include "extension/extension.h"
 #include "execve/elf.h"
@@ -347,6 +348,9 @@ int event_loop()
 
 		/* This is the only safe place to free tracees.  */
 		free_terminated_tracees();
+
+		/* Close shadow pipe read ends whose last writer exited.  */
+		shadow_pipes_close_eof();
 
 		/* Wait for the next tracee's stop. */
 		pid = waitpid(-1, &tracee_status, __WALL);
@@ -694,11 +698,20 @@ int handle_tracee_event(Tracee *tracee, int tracee_status)
 				if (!IS_IN_SYSENTER(tracee)) {
 					VERBOSE(tracee, 1, "Handling syscall exit from SIGSYS");
 					translate_syscall(tracee);
+					/* The synthesized sysexit above runs the regular
+					 * sysexit handlers; for fully-emulated calls (e.g.
+					 * setresgid) those poke SYSARG_RESULT.  On ARM/ARM64
+					 * SYSARG_RESULT and SYSARG_1 are the same register, so
+					 * the blocked syscall's first argument is now clobbered
+					 * with the faked result.  Tell handle_seccomp_event to
+					 * restore it from the entry snapshot.  */
+					tracee->restore_sysarg1_after_sigsys = true;
 				}
 
 				if (tracee->skip_next_seccomp_signal || (seccomp_after_ptrace_enter && siginfo.si_syscall == SYSCALL_AVOIDER)) {
 					VERBOSE(tracee, 4, "suppressed SIGSYS after void syscall");
 					tracee->skip_next_seccomp_signal = false;
+					tracee->restore_sysarg1_after_sigsys = false;
 					signal = 0;
 				} else {
 					signal = handle_seccomp_event(tracee);
