@@ -21,6 +21,7 @@
  */
 
 #include <errno.h>       /* errno(3), E* */
+#include <stdio.h>       /* sscanf(3), */
 #include <sys/utsname.h> /* struct utsname, */
 #include <linux/net.h>   /* SYS_*, */
 #include <linux/ioctl.h> /* _IOW, */
@@ -77,16 +78,8 @@ void translate_syscall_exit(Tracee *tracee)
 
 	/* If proot changed syscall to PR_void during enter,
 	 * keep syscall result set during entry. */
-	if (peek_reg(tracee, MODIFIED, SYSARG_NUM) ==
-#if defined(ARCH_ARM64) || defined(ARCH_X86_64)
-			(is_32on64_mode(tracee) ? (SYSCALL_AVOIDER & 0xFFFFFFFF) : SYSCALL_AVOIDER)
-#else
-			SYSCALL_AVOIDER
-#endif
-			&&
-			peek_reg(tracee, ORIGINAL, SYSARG_NUM) != peek_reg(tracee, MODIFIED, SYSARG_NUM)) {
+	if (is_voided_syscall(tracee, MODIFIED))
 		poke_reg(tracee, SYSARG_RESULT, peek_reg(tracee, MODIFIED, SYSARG_RESULT));
-	}
 
 	/* Translate output arguments:
 	 * - break: update the syscall result register with "status"
@@ -345,6 +338,9 @@ void translate_syscall_exit(Tracee *tracee)
 		size_t max_size;
 		word_t input;
 		word_t output;
+		struct readlink_proc_fd_state proc_fd = {
+			.pid = 0, .fd = -1, .host_path = referee, .substituted = false,
+		};
 
 		/* Error reported by the kernel.  */
 		if ((int) syscall_result < 0)
@@ -396,9 +392,26 @@ void translate_syscall_exit(Tracee *tracee)
 				status = -EBADF;
 				break;
 			}
+			proc_fd.pid = tracee->pid;
+			proc_fd.fd  = (int) dirfd;
 			status = readlink_proc_pid_fd(tracee->pid, dirfd, referer);
 			if (status < 0)
 				break;
+		}
+		else {
+			/* Note the descriptor when the tracee read the content
+			 * of "/proc/<PID>/fd/<FD>": extensions may report it
+			 * differently than the kernel does.  Remember: "/proc"
+			 * paths were canonicalized, "self" included.  */
+			int fd_pid;
+			int fd_number;
+			char extra;
+
+			if (sscanf(referer, "/proc/%d/fd/%d%c", &fd_pid, &fd_number, &extra) == 2
+			    && fd_number >= 0) {
+				proc_fd.pid = (pid_t) fd_pid;
+				proc_fd.fd  = fd_number;
+			}
 		}
 
 		/* If the kernel filled the whole output buffer, the symlink
@@ -422,14 +435,28 @@ void translate_syscall_exit(Tracee *tracee)
 			}
 		}
 
+		/* Let extensions report another path for this descriptor;
+		 * link2symlink names the file the way the tracee opened it
+		 * instead of the way it is stored in the l2s directory.  */
+		if (proc_fd.fd >= 0) {
+			status = notify_extensions(tracee, READLINK_PROC_FD, (intptr_t) &proc_fd, 0);
+			if (status < 0)
+				break;
+		}
+
 		status = detranslate_path(tracee, referee, referer);
 		if (status < 0)
 			break;
 
 		/* The original path doesn't require any transformation, i.e
 		 * it is a symetric binding.  */
-		if (status == 0)
-			goto end;
+		if (status == 0) {
+			/* ... unless its content was substituted just above,
+			 * in which case the tracee has to be told about it.  */
+			if (!proc_fd.substituted)
+				goto end;
+			status = strlen(referee) + 1;
+		}
 
 		/* Overwrite the path.  Note: the output buffer might be
 		 * initialized with zeros but it was updated with the kernel
@@ -722,17 +749,50 @@ void translate_syscall_exit(Tracee *tracee)
 					/* Avoid duplicates.  */
 					bool present = false;
 					for (i = 0; i < tracee->fake_netlink_fds_count; i++) {
-						if (tracee->fake_netlink_fds[i] == fd) {
+						if (tracee->fake_netlink_fds[i].fd == fd) {
+							present = true;
+							break;
+						}
+					}
+					if (!present) {
+						struct fake_netlink_socket *sock =
+							&tracee->fake_netlink_fds[tracee->fake_netlink_fds_count++];
+						memset(sock, 0, sizeof(*sock));
+						sock->fd = fd;
+					}
+				}
+			}
+			tracee->pending_fake_netlink_socket = false;
+		}
+
+		/* Same for a NETLINK_ROUTE socket the host granted as is:
+		 * requests sent on it still need the ack emulation when
+		 * the tracee thinks it owns a network namespace.  */
+		if (tracee->pending_real_netlink_socket) {
+			int fd = (int) peek_reg(tracee, CURRENT, SYSARG_RESULT);
+			if (fd >= 0) {
+				int i;
+				if (tracee->netlink_route_fds_count < MAX_NETLINK_ROUTE_FDS) {
+					bool present = false;
+					for (i = 0; i < tracee->netlink_route_fds_count; i++) {
+						if (tracee->netlink_route_fds[i] == fd) {
 							present = true;
 							break;
 						}
 					}
 					if (!present)
-						tracee->fake_netlink_fds[tracee->fake_netlink_fds_count++] = fd;
+						tracee->netlink_route_fds[tracee->netlink_route_fds_count++] = fd;
 				}
 			}
-			tracee->pending_fake_netlink_socket = false;
+			tracee->pending_real_netlink_socket = false;
 		}
+		goto end;
+
+	case PR_recvfrom:
+	case PR_recvmsg:
+		/* Turn the kernel's refusal to reconfigure a network
+		 * namespace the tracee doesn't really have into an ack.  */
+		handle_netlink_reply_exit(tracee, syscall_number);
 		goto end;
 
 	default:

@@ -109,23 +109,56 @@ typedef struct tracee {
 	 * stay scoped to the would-be namespace.  Reset once consumed.  */
 	bool clone_stripped_newns;
 
+	/* Same for CLONE_NEWNET, propagated to the new child as
+	 * "fake_netns" below.  Reset once consumed.  */
+	bool clone_stripped_newnet;
+
+	/* Set once this tracee asked for a network namespace of its own
+	 * -- clone(2) or unshare(2) with CLONE_NEWNET -- and PRoot
+	 * pretended it got one.  Inherited by children, which would
+	 * share that namespace.  */
+	bool fake_netns;
+
 	/* Emulation of AF_NETLINK / NETLINK_ROUTE sockets for
 	 * sandbox helpers like bubblewrap that try to bring up the
 	 * loopback interface inside their would-be net namespace.
-	 * fake_netlink_fds holds the fds of sockets we silently
+	 * fake_netlink_fds holds one entry per socket we silently
 	 * redirected from AF_NETLINK to AF_UNIX/SOCK_DGRAM; see
-	 * enter.c / exit.c for the intercepts.  */
+	 * enter.c / exit.c for the intercepts.
+	 *
+	 * "reply" is what PRoot synthesised at send time for that socket's
+	 * latest request, waiting for the matching recvmsg / recvfrom.  It
+	 * belongs to the socket rather than to the tracee because sockets
+	 * have receive queues of their own: iproute2 walks a route dump on
+	 * one of them while a second answers the interface lookups it makes
+	 * along the way.  The buffer is allocated on demand and handed back
+	 * one datagram at a time ("reply_off" is how far the tracee has
+	 * read), since that is how the kernel delivers a dump.  */
 #define MAX_FAKE_NETLINK_FDS 8
-	int fake_netlink_fds[MAX_FAKE_NETLINK_FDS];
+#define MAX_FAKE_NETLINK_REPLY 8192
+	struct fake_netlink_socket {
+		int fd;
+		uint8_t *reply;
+		size_t reply_len;
+		size_t reply_off;
+	} fake_netlink_fds[MAX_FAKE_NETLINK_FDS];
 	int fake_netlink_fds_count;
 	bool pending_fake_netlink_socket;
-	/* Reply synthesised at send time for the most recent request on a
-	 * fake netlink fd, awaiting the matching recvmsg / recvfrom.  The
-	 * buffer is word-aligned because we lay out struct nlmsghdr and the
-	 * rtnetlink payloads directly into it.  */
-#define MAX_FAKE_NETLINK_REPLY 8192
-	uint8_t fake_netlink_reply[MAX_FAKE_NETLINK_REPLY] __attribute__((aligned(8)));
-	size_t fake_netlink_reply_len;
+
+	/* Fds of the *real* NETLINK_ROUTE sockets a tracee got when the
+	 * host didn't need the substitution above.  Such a socket lives
+	 * in the host's network namespace, where a tracee has no
+	 * CAP_NET_ADMIN, so the requests a fake_netns tracee sends to
+	 * configure "its" namespace come back as NLMSG_ERROR(-EPERM);
+	 * netlink_ack_* remembers which reply to turn into a plain ack
+	 * (see handle_netlink_reply_exit).  */
+#define MAX_NETLINK_ROUTE_FDS 8
+	int netlink_route_fds[MAX_NETLINK_ROUTE_FDS];
+	int netlink_route_fds_count;
+	bool pending_real_netlink_socket;
+	bool netlink_ack_pending;
+	int netlink_ack_fd;
+	uint32_t netlink_ack_seq;
 
 	/* Support for ptrace emulation (tracer side).  */
 	struct {
@@ -195,6 +228,13 @@ typedef struct tracee {
 	/* True if next SIGSYS caused by seccomp should be silently dropped
 	 * without affecting state of any registers.  */
 	bool skip_next_seccomp_signal;
+
+	/* True when the sysenter stage voided the current syscall into a
+	 * number the host kernel cancels instead of executing.  Such a
+	 * syscall reports no sysenter ptrace stop, only a sysexit one, so
+	 * the event loop must not expect the former.  Set at the end of
+	 * the sysenter stage by translate_syscall().  */
+	bool voided_syscall_cancelled;
 
 	/* True when an outer-seccomp SIGSYS was preceded by a synthesized
 	 * sysexit (translate_syscall) that may have poked SYSARG_RESULT.  On
@@ -281,6 +321,14 @@ typedef struct tracee {
 	/* Ensure the sysexit stage is always hit under seccomp.  */
 	bool sysexit_pending;
 
+	/* True when the kernel reported a fork event of this tracee
+	 * without the new child's PID; the child, created with
+	 * pending_clone_flags and starting with the stack pointer
+	 * pending_child_sp, is then registered later (see new_child()).  */
+	bool pending_child;
+	word_t pending_clone_flags;
+	word_t pending_child_sp;
+
 	/* If true, syscall entry was handled by seccomp and next SIGTRAP | 0x80
 	 * has to be ignored as it's same syscall entry */
 	bool seccomp_already_handled_enter;
@@ -361,6 +409,8 @@ extern Tracee *get_stopped_ptracee(const Tracee *ptracer, pid_t pid,
 				bool only_with_pevent, word_t wait_options);
 extern bool has_ptracees(const Tracee *ptracer, pid_t pid, word_t wait_options);
 extern int new_child(Tracee *parent, word_t clone_flags);
+extern void resolve_pending_child(Tracee *parent);
+extern void adopt_held_children(void);
 extern Tracee *new_dummy_tracee(TALLOC_CTX *context);
 extern void terminate_tracee(Tracee *tracee);
 extern void free_terminated_tracees();
