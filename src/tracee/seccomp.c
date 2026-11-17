@@ -63,6 +63,21 @@ void set_result_after_seccomp(Tracee *tracee, word_t result) {
 }
 
 /**
+ * Make the ORIGINAL registers those of the syscall that raised the
+ * SIGSYS, for one emulated right here that translates a path.  No
+ * sysenter stop saved them, so the extensions notified during the
+ * translation would see an earlier syscall instead: with -0, fake_id0
+ * took a statx(2) for the chmod(2) made before it, and gave the file
+ * statx(2) looked at the mode chmod(2) had set.
+ */
+static void set_original_regs_after_seccomp(Tracee *tracee)
+{
+	/* Not save_current_regs(): the registers changed so far must still
+	 * be pushed.  */
+	memcpy(&tracee->_regs[ORIGINAL], &tracee->_regs[CURRENT], sizeof(tracee->_regs[CURRENT]));
+}
+
+/**
  * Handle SIGSYS signal that was caused by system seccomp policy.
  *
  * Return 0 to swallow signal or SIGSYS to deliver it to process.
@@ -314,6 +329,9 @@ static int handle_seccomp_event_common(Tracee *tracee)
 		char devshm_path[PATH_MAX];
 		struct statfs64 my_statfs64;
 		struct compat_statfs my_statfs;
+
+		set_original_regs_after_seccomp(tracee);
+
 		size = read_string(tracee, original, peek_reg(tracee, CURRENT, SYSARG_1), PATH_MAX);
 		if (size < 0) {
 			set_result_after_seccomp(tracee, size);
@@ -582,6 +600,7 @@ static int handle_seccomp_event_common(Tracee *tracee)
 
 	case PR_statx:
 	{
+		set_original_regs_after_seccomp(tracee);
 		set_result_after_seccomp(tracee, handle_statx_syscall(tracee, true));
 		break;
 	}
@@ -625,6 +644,24 @@ static int handle_seccomp_event_common(Tracee *tracee)
 		set_result_after_seccomp(tracee, ret);
 		break;
 	}
+
+	case PR_fork:
+		/* Android's app seccomp policy only allows fork(2) on
+		 * 32-bit ABIs, yet musl calls it directly on x86_64.
+		 * fork(2) is clone(2) with just SIGCHLD and no other
+		 * argument, on every architecture PRoot supports (only
+		 * the last two arguments are ever swapped).  The parent
+		 * gets back the registers overwritten here at the exit
+		 * stage, the child at its first stop (see
+		 * attach_child()).  */
+		set_sysnum(tracee, PR_clone);
+		poke_reg(tracee, SYSARG_1, SIGCHLD);
+		poke_reg(tracee, SYSARG_2, 0);
+		poke_reg(tracee, SYSARG_3, 0);
+		poke_reg(tracee, SYSARG_4, 0);
+		poke_reg(tracee, SYSARG_5, 0);
+		restart_syscall_after_seccomp(tracee);
+		break;
 
 	case PR_set_robust_list:
 	default:

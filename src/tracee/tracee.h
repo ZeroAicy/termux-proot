@@ -218,6 +218,19 @@ typedef struct tracee {
 	bool restore_original_regs;
 	bool restore_original_regs_after_seccomp_event;
 
+	/* True when the fork-like syscall which created the child
+	 * being registered is one PRoot runs in place of another, that
+	 * the outer seccomp policy rejected: fork(2) is run as clone(2)
+	 * with other arguments, see handle_seccomp_event_common().  Set
+	 * by new_child(), consumed by attach_child().  */
+	bool fork_rewritten_after_seccomp;
+
+	/* True until the first stop of a child created that way: it
+	 * then gets back the registers its parent had before the
+	 * rewrite, as the parent does at the exit stage, see
+	 * restore_child_regs_after_seccomp().  */
+	bool restore_regs_at_first_stop;
+
 	/* State for the special handling of SIGSTOP.  */
 	enum {
 		SIGSTOP_IGNORED = 0,  /* Ignore SIGSTOP (once the parent is known).  */
@@ -409,6 +422,7 @@ extern Tracee *get_stopped_ptracee(const Tracee *ptracer, pid_t pid,
 				bool only_with_pevent, word_t wait_options);
 extern bool has_ptracees(const Tracee *ptracer, pid_t pid, word_t wait_options);
 extern int new_child(Tracee *parent, word_t clone_flags);
+extern Tracee *get_execve_tracee(Tracee *leader);
 extern void resolve_pending_child(Tracee *parent);
 extern void adopt_held_children(void);
 extern Tracee *new_dummy_tracee(TALLOC_CTX *context);

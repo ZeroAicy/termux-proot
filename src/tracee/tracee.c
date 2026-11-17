@@ -32,6 +32,7 @@
 #include <talloc.h>     /* talloc_*, */
 #include <signal.h>     /* kill(2), SIGKILL, */
 #include <sys/ptrace.h> /* ptrace(2), PTRACE_*, */
+#include <sys/wait.h>   /* waitid(2), */
 #include <errno.h>      /* E*, */
 #include <inttypes.h>   /* PRI*, */
 
@@ -377,6 +378,84 @@ void free_terminated_tracees()
 	}
 }
 
+/**
+ * Return the tracee which did the execve(2) reported by the
+ * PTRACE_EVENT_EXEC stop of @leader.  When a thread other than the
+ * leader of its process calls execve(2), the kernel kills all the
+ * other threads, then it releases the leader without reporting its
+ * death and gives its PID to the calling thread, whose own TID
+ * disappears just as silently:
+ *
+ *     In this stop, the tracer can use PTRACE_GETEVENTMSG to
+ *     retrieve the tracee's former thread ID.
+ *     [...]
+ *     On receiving the PTRACE_EVENT_EXEC stop notification, the
+ *     tracer should clean up all its internal data structures
+ *     describing the threads of this process, and retain only one
+ *     data structure
+ *
+ *     -- ptrace(2) man-page
+ *
+ * The one to retain is the entry of the thread, it carries the
+ * state of that execve(2), whose exit stage is still to come.  Left
+ * as is, this exit stage would be handled with the entry of the
+ * leader, and the one of the thread would never be freed, until
+ * attach_child() runs into it once the kernel reuses its TID.
+ *
+ * Note: this is meant to be called by the event loop only, right
+ * after waitpid(2), where nothing refers to the entry it frees.
+ */
+Tracee *get_execve_tracee(Tracee *leader)
+{
+	unsigned long former_pid = 0;
+	Tracee *relative;
+	Tracee *thread;
+	int status;
+
+	status = ptrace(PTRACE_GETEVENTMSG, leader->pid, NULL, &former_pid);
+	if (status < 0 || former_pid == 0 || (pid_t) former_pid == leader->pid)
+		return leader;
+
+	thread = get_tracee(leader, (pid_t) former_pid, false);
+	if (thread == NULL)
+		return leader;
+
+	VERBOSE(thread, 1, "vpid %" PRIu64 ": execve(2) from thread %d of pid %d",
+		thread->vpid, thread->pid, leader->pid);
+
+	/* From now on, the thread is the process the leader was.  */
+	LIST_FOREACH(relative, &tracees, link) {
+		if (relative->parent == leader)
+			relative->parent = thread;
+	}
+
+	thread->pid    = leader->pid;
+	thread->vpid   = leader->vpid;
+	thread->parent = leader->parent;
+	thread->clone  = leader->clone;
+	thread->killall_on_exit = leader->killall_on_exit;
+
+	/* Not terminate_tracee(): the process isn't over.  */
+	TALLOC_FREE(leader);
+
+	return thread;
+}
+
+/**
+ * Tell whether PRoot is still the tracer of its new child @pid.  A
+ * child can be killed before PRoot gets the event of the fork-like
+ * syscall which created it, then its death can be reported first.
+ * PRoot isn't its tracer anymore once that's done.
+ */
+static bool is_still_traced(pid_t pid)
+{
+	siginfo_t info;
+	int status;
+
+	status = waitid(P_PID, pid, &info, WEXITED | WSTOPPED | WNOHANG | WNOWAIT | __WALL);
+	return (status == 0 || errno != ECHILD);
+}
+
 static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid);
 
 /**
@@ -603,6 +682,12 @@ int new_child(Tracee *parent, word_t clone_flags)
                 // contains the usual clone flags.
                 clone_flags = peek_word(parent, peek_reg(parent, CURRENT, SYSARG_1));
 
+	/* A fork-like syscall that PRoot restarted in place of one the
+	 * outer seccomp policy rejected (see
+	 * restart_syscall_after_seccomp()) can only be the clone(2) it
+	 * runs for fork(2).  */
+	parent->fork_rewritten_after_seccomp = parent->restore_original_regs_after_seccomp_event;
+
 	/* Get the pid of the parent's new child.  Some kernels (seen
 	 * on aarch64 4.14.357 builds) clear the message of the last
 	 * ptrace event on every ptrace request, so the PID reads as 0,
@@ -633,7 +718,32 @@ static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
 	int ptrace_options;
 	Tracee *child;
 
-	child = get_tracee(parent, pid, true);
+	child = get_tracee(parent, pid, false);
+
+	/* Nothing was heard from this child yet, but it might be dead
+	 * already, and PRoot done with it (see is_still_traced()).
+	 * An entry created for it would then never be freed.  */
+	if (child == NULL && !is_still_traced(pid)) {
+		VERBOSE(parent, 1, "vpid %" PRIu64 ": child %d is gone already",
+			parent->vpid, pid);
+		parent->fork_rewritten_after_seccomp = false;
+		parent->clone_stripped_newns = false;
+		parent->clone_stripped_newnet = false;
+		return 0;
+	}
+
+	/* The kernel has just given @pid to this new child, so an
+	 * entry already set up for it was left by a former process
+	 * whose end PRoot missed: replace this entry.  */
+	if (child != NULL && child->exe != NULL) {
+		VERBOSE(parent, 1, "vpid %" PRIu64 ": pid %d reused, dropping vpid %" PRIu64,
+			parent->vpid, pid, child->vpid);
+		terminate_tracee(child);
+		child = NULL;
+	}
+
+	if (child == NULL)
+		child = new_tracee(pid);
 	if (child == NULL) {
 		note(parent, WARNING, SYSTEM, "running out of memory");
 		return -ENOMEM;
@@ -664,6 +774,18 @@ static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
 #ifdef ARCH_ARM64
 	child->is_aarch32 = parent->is_aarch32;
 #endif
+
+	/* The child starts with a copy of the registers its parent
+	 * had when entering the syscall, ie. with the arguments PRoot
+	 * put there to run fork(2) as clone(2).  The kernel would have
+	 * preserved the original ones, so give them back to the child
+	 * at its first stop, as they are to the parent at the exit
+	 * stage.  */
+	if (parent->fork_rewritten_after_seccomp) {
+		parent->fork_rewritten_after_seccomp = false;
+		child->_regs[ORIGINAL_SECCOMP_REWRITE] = parent->_regs[ORIGINAL_SECCOMP_REWRITE];
+		child->restore_regs_at_first_stop = true;
+	}
 
 	/* If CLONE_VM is set, the calling process and the child
 	 * process run in the same memory space [...] any memory
@@ -841,11 +963,16 @@ static int attach_child(Tracee *parent, word_t clone_flags, pid_t pid)
 	inherit_extensions(child, parent, clone_flags);
 
 	/* Restart the child tracee if it was already alive but
-	 * stopped until that moment.  */
-	if (child->sigstop == SIGSTOP_PENDING) {
+	 * stopped until that moment.  It isn't stopped anymore if it
+	 * was killed in the meantime: it was restarted towards its
+	 * death from its PTRACE_EVENT_EXIT stop already.  */
+	if (child->sigstop == SIGSTOP_PENDING && !child->running) {
 		bool keep_stopped = false;
 
 		child->sigstop = SIGSTOP_ALLOWED;
+
+		/* This SIGSTOP was its first stop.  */
+		restore_child_regs_after_seccomp(child);
 
 		/* Notify its ptracer if it is ready to be traced.  */
 		if (child->as_ptracee.ptracer != NULL) {
